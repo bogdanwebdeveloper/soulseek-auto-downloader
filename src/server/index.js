@@ -253,6 +253,152 @@ app.post('/api/download', ensureConnected, async (req, res) => {
   res.json({ success: true, item: queueItem });
 });
 
+// Helper to clean search query from parent folder to bypass censorship
+function getSearchQueryFromFolder(parentFolder, artistFolder) {
+  let query = parentFolder;
+
+  // If the folder name contains a clear " - " separator (e.g. "Michael Jackson - Thriller")
+  if (parentFolder.includes(' - ')) {
+    const parts = parentFolder.split(' - ');
+    // Take the last part, which is usually the album name
+    query = parts[parts.length - 1];
+  }
+
+  // Remove known censored words to avoid server-side search block
+  const censoredWords = [
+    'michael jackson', 'the weeknd', 'weeknd', 'metallica', 'pink floyd', 
+    'linkin park', 'madonna', 'eminem', 'beatles', 'led zeppelin', 'coldplay'
+  ];
+  
+  let cleanedQuery = query;
+  censoredWords.forEach(word => {
+    const regex = new RegExp(word, 'gi');
+    cleanedQuery = cleanedQuery.replace(regex, '');
+  });
+
+  cleanedQuery = cleanedQuery.replace(/\s+/g, ' ').trim();
+
+  // If the query becomes too short or empty, fallback to the original parentFolder or the artist folder
+  if (cleanedQuery.length < 3) {
+    return parentFolder;
+  }
+
+  return cleanedQuery;
+}
+
+// API: Download all tracks in an album folder from a specific user
+app.post('/api/download-album', ensureConnected, async (req, res) => {
+  const { user, parentFolder, artistFolder, sampleFile } = req.body;
+
+  if (!user || !parentFolder || !sampleFile) {
+    return res.status(400).json({ error: 'Missing required parameters: user, parentFolder, sampleFile' });
+  }
+
+  let searchQuery = getSearchQueryFromFolder(parentFolder, artistFolder);
+  const genericFolders = ['cd1', 'cd2', 'cd 1', 'cd 2', 'flac', 'mp3', 'disc 1', 'disc 2', 'disc1', 'disc2', 'unknown album', 'music', 'downloads'];
+  if (genericFolders.includes(parentFolder.toLowerCase()) && artistFolder) {
+    searchQuery = `${artistFolder} ${searchQuery}`;
+  }
+
+  console.log(`[Album Download] Request received for album "${parentFolder}" by user "${user}".`);
+  console.log(`[Album Download] Searching for files using query: "${searchQuery}"...`);
+
+  try {
+    // Perform a Soulseek search with safety filter disabled to get all album tracks
+    const results = await search(slskClient, searchQuery, {
+      flacOnly: false,
+      minSizeMB: 0,
+      timeoutMs: 8000,
+      enableSafetyFilter: false
+    });
+
+    console.log(`[Album Download] Search complete. Found ${results.length} raw results. Filtering for user "${user}" and folder "${parentFolder}"...`);
+
+    const normalizedSample = sampleFile.replace(/\\/g, '/');
+    const sampleParts = normalizedSample.split('/');
+    const targetParentIndex = sampleParts.length - 2;
+    const targetArtistIndex = sampleParts.length - 3;
+    
+    const targetParentName = targetParentIndex >= 0 ? sampleParts[targetParentIndex].toLowerCase() : '';
+    const targetArtistName = targetArtistIndex >= 0 ? sampleParts[targetArtistIndex].toLowerCase() : '';
+
+    // Filter results to match target user and specific folder name
+    const albumTracks = results.filter(item => {
+      if (item.user !== user) return false;
+
+      const itemNormalized = item.file.replace(/\\/g, '/');
+      const itemParts = itemNormalized.split('/');
+      if (itemParts.length < 2) return false;
+
+      const itemParentName = itemParts[itemParts.length - 2].toLowerCase();
+
+      if (itemParentName !== targetParentName) {
+        if (genericFolders.includes(targetParentName) && itemParts.length >= 3) {
+          const itemArtistName = itemParts[itemParts.length - 3].toLowerCase();
+          if (itemArtistName !== targetArtistName) return false;
+        } else {
+          return false;
+        }
+      }
+
+      const ext = path.extname(itemNormalized).toLowerCase();
+      const allowedExts = ['.flac', '.mp3', '.m4a', '.wav', '.cue', '.log', '.jpg', '.jpeg', '.png', '.m3u', '.sfv'];
+      return allowedExts.includes(ext);
+    });
+
+    if (albumTracks.length === 0) {
+      console.log(`[Album Download] No tracks found for user "${user}" in folder "${parentFolder}".`);
+      return res.status(404).json({ error: `Could not find any files for user "${user}" in folder "${parentFolder}".` });
+    }
+
+    // Sort by file name to download in track order
+    albumTracks.sort((a, b) => a.file.localeCompare(b.file));
+
+    console.log(`[Album Download] Found ${albumTracks.length} files in the album folder. Enqueueing them...`);
+
+    const addedItems = [];
+
+    albumTracks.forEach(file => {
+      const filename = path.basename(file.file.replace(/\\/g, '/'));
+      const downloadId = `${file.user}_${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
+
+      const queueItem = {
+        id: downloadId,
+        filename,
+        user: file.user,
+        size: file.size,
+        sizeMB: (file.size / (1024 * 1024)).toFixed(2),
+        status: 'Downloading',
+        addedAt: new Date().toISOString(),
+        completedAt: null,
+        error: null
+      };
+
+      downloadQueue.unshift(queueItem);
+      addedItems.push(queueItem);
+
+      downloadFile(slskClient, file, DOWNLOAD_DIR)
+        .then((savedPath) => {
+          queueItem.status = 'Completed';
+          queueItem.completedAt = new Date().toISOString();
+          queueItem.savedPath = savedPath;
+          console.log(`[Server] Download completed: ${filename}`);
+        })
+        .catch((err) => {
+          queueItem.status = 'Failed';
+          queueItem.error = err.message;
+          console.error(`[Server] Download failed for: ${filename}`, err);
+        });
+    });
+
+    res.json({ success: true, count: addedItems.length, items: addedItems });
+
+  } catch (error) {
+    console.error('[Album Download] Error searching/downloading album:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // API: Batch download list
 app.post('/api/batch-download', (req, res) => {
   const { queries, flacOnly, minSize } = req.body;

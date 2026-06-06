@@ -1170,20 +1170,32 @@
     // Download Complete Album Folder
     async function startAlbumDownload(tracksJsonStr, button) {
       const tracks = JSON.parse(decodeURIComponent(tracksJsonStr));
+      if (!tracks || tracks.length === 0) return;
+      
+      const firstTrack = tracks[0];
+      const parts = firstTrack.file.replace(/\\/g, '/').split('/');
+      const parentFolder = parts.length >= 2 ? parts[parts.length - 2] : '';
+      const artistFolder = parts.length >= 3 ? parts[parts.length - 3] : '';
+
       button.disabled = true;
-      button.innerText = 'Starting Album...';
+      button.innerText = 'Searching Album...';
 
       try {
-        const response = await fetch('/api/download', {
+        const response = await fetch('/api/download-album', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fileResults: tracks })
+          body: JSON.stringify({
+            user: firstTrack.user,
+            parentFolder: parentFolder,
+            artistFolder: artistFolder,
+            sampleFile: firstTrack.file
+          })
         });
         const data = await response.json();
 
         if (data.error) throw new Error(data.error);
 
-        button.innerText = 'Album Downloading';
+        button.innerText = `Album Downloading (${data.count} tracks)`;
         button.style.background = 'rgba(57, 255, 20, 0.2)';
         button.style.color = 'var(--accent-green)';
         fetchQueue();
